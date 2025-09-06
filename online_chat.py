@@ -1,150 +1,96 @@
+import os
 import socket
 import threading
-import sys
-from getpass import getpass
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+import base64
 
-# ====================== CONFIG ======================
-PORT = 54321  # Chat server port
-PASSWORD = "1234"  # Change this before sharing
+# ================= Configuration =================
+MODE = os.getenv("CHAT_MODE", "server")  # "server" or "client"
+PASSWORD = os.getenv("CHAT_PASSWORD", "1234")
+USERNAME = os.getenv("CHAT_USERNAME", "Guest")
+HOST = os.getenv("CHAT_HOST", "127.0.0.1")  # Server IP for client
+PORT = int(os.getenv("CHAT_PORT", 54321))
+# ================================================
 
-# ====================== SERVER ======================
-clients = []
-usernames = {}
+# AES Encryption helpers
+def pad(s):
+    return s + (16 - len(s) % 16) * " "
 
-def broadcast(message, sender=None):
-    for client in clients:
-        if client != sender:
-            try:
-                client.send(message.encode())
-            except:
-                pass
+def encrypt(msg, key):
+    cipher = AES.new(key, AES.MODE_ECB)
+    return base64.b64encode(cipher.encrypt(pad(msg).encode())).decode()
 
-def handle_client(conn, addr, server_password):
-    try:
-        # Ask client for password
-        conn.send("PASSWORD:".encode())
-        pw = conn.recv(1024).decode()
-        if pw != server_password:
-            conn.send("❌ Wrong password. Disconnecting.".encode())
-            conn.close()
-            return
+def decrypt(msg, key):
+    cipher = AES.new(key, AES.MODE_ECB)
+    return cipher.decrypt(base64.b64decode(msg)).decode().rstrip()
 
-        # Ask for username
-        conn.send("USERNAME:".encode())
-        username = conn.recv(1024).decode()
-        usernames[conn] = username
-        clients.append(conn)
-        broadcast(f"[JOIN] {username} joined the chat")
-        broadcast_user_list()
+key = pad(PASSWORD)[:16].encode()  # 16-byte AES key
 
-        while True:
-            msg = conn.recv(4096).decode()
-            if not msg or msg.lower() == "exit":
-                break
-            broadcast(f"{username}: {msg}", conn)
-    except:
-        pass
-    finally:
-        clients.remove(conn)
-        broadcast(f"[LEAVE] {usernames.get(conn, 'Unknown')} left the chat")
-        broadcast_user_list()
-        conn.close()
-
-def broadcast_user_list():
-    user_list = ", ".join(usernames.values())
-    broadcast(f"[USERS] {user_list}")
-
-def run_server(server_password=PASSWORD):
-    host = "0.0.0.0"  # Listen on all interfaces
-    print(f"✅ Server running on {host}:{PORT}")
+# ================= Server =================
+def run_server():
+    clients = []
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind((host, PORT))
+    server.bind(("0.0.0.0", PORT))
     server.listen(5)
+    print(f"✅ Server running on 0.0.0.0:{PORT}")
 
-    def accept_clients():
-        while True:
-            conn, addr = server.accept()
-            threading.Thread(target=handle_client, args=(conn, addr, server_password), daemon=True).start()
-
-    threading.Thread(target=accept_clients, daemon=True).start()
-
-    # Server input loop
-    while True:
-        cmd = input()
-        if cmd.lower() == "exit":
-            print("Shutting down server...")
-            for c in clients:
-                try:
-                    c.send("Server is shutting down.".encode())
-                    c.close()
-                except:
-                    pass
-            server.close()
-            break
-        else:
-            broadcast(f"[SERVER]: {cmd}")
-
-# ====================== CLIENT ======================
-def run_client():
-    host = input("Enter server IP / domain: ")
-    username = input("Enter your username: ")
-    password = getpass("Enter server password: ")
-
-    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        client.connect((host, PORT))
-    except:
-        print("❌ Could not connect to server.")
-        return
-
-    # Receive password prompt
-    prompt = client.recv(1024).decode()
-    if "PASSWORD" in prompt:
-        client.send(password.encode())
-    # Receive username prompt
-    prompt = client.recv(1024).decode()
-    if "USERNAME" in prompt:
-        client.send(username.encode())
-
-    print("✅ Connected to server! Type 'exit' to leave.\n")
-
-    def receive_messages():
-        while True:
-            try:
-                msg = client.recv(4096).decode()
+    def handle_client(conn, addr):
+        try:
+            name = decrypt(conn.recv(1024).decode(), key)
+            welcome = f"{name} joined the chat."
+            broadcast(welcome, conn)
+            while True:
+                msg = conn.recv(4096).decode()
                 if not msg:
                     break
+                broadcast(decrypt(msg, key), conn)
+        except:
+            pass
+        finally:
+            conn.close()
+            clients.remove(conn)
+
+    def broadcast(message, sender=None):
+        for c in clients:
+            if c != sender:
+                try:
+                    c.send(encrypt(message, key).encode())
+                except:
+                    pass
+
+    while True:
+        conn, addr = server.accept()
+        clients.append(conn)
+        threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+
+# ================= Client =================
+def run_client():
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client.connect((HOST, PORT))
+    client.send(encrypt(USERNAME, key).encode())
+
+    def receive():
+        while True:
+            try:
+                msg = decrypt(client.recv(4096).decode(), key)
                 print(msg)
             except:
                 break
 
-    threading.Thread(target=receive_messages, daemon=True).start()
+    threading.Thread(target=receive, daemon=True).start()
 
     while True:
-        msg = input()
+        msg = input()  # Only used for local clients
         if msg.lower() == "exit":
-            client.send("exit".encode())
-            client.close()
             break
-        client.send(msg.encode())
+        client.send(encrypt(msg, key).encode())
 
-# ====================== MAIN ======================
-def main():
-    print("=== Online Chat ===")
-    print("1. Start Server")
-    print("2. Connect as Client")
-    choice = input("Choose an option: ")
-    if choice == "1":
-        new_password = getpass("Set server password (default is 1234): ")
-        if new_password.strip() != "":
-            run_server(new_password)
-        else:
-            run_server()
-    elif choice == "2":
+# ================= Main =================
+if __name__ == "__main__":
+    if MODE.lower() == "server":
+        run_server()
+    elif MODE.lower() == "client":
         run_client()
     else:
-        print("Invalid choice")
-
-# ====================== ENTRY ======================
-if __name__ == "__main__":
-    main()
+        print("Invalid MODE! Set CHAT_MODE=server or client.")
